@@ -380,6 +380,33 @@ decode (an empty body, or one cut short where the server sent no length) is remo
 cache and counts as that source failing (`<source>:undecodable`), so it is asked again later instead
 of failing every session.
 
+### Surface-model places (`server/dsmmode.py`)
+Where Mapterhorn has no tile deeper than z12 (no national lidar: Russia, Kazakhstan, most of Asia, Africa and South
+America) its elevation is Copernicus GLO-30, a 30 m surface model, put through `dsmground`. The road and bridge
+constants were tuned on lidar, so the generators read `dsmmode.is_dsm(lat, lon)` (per z12 tile, cached; two z13
+tiles asked once) and switch there to:
+- road profiles: a running 20th percentile over 90 m, a 45 m Gaussian (dirt roads 20 m), held under 8 % (major
+  roads) or 14 % (others), both point-reflected at the ends (`grading.dsm_profile`);
+- junctions: every contact between two ground roads (an end on another road, a crossing) meets at one height, the
+  higher class's or the mean of two of a class, faded out over 120 m (`grading.snap_profile`,
+  `Grader._snapped_z`);
+- overpasses: approach ramps for every class (also motorways, trunks and their links), up to 8.5 m, a ramp kept off
+  the roads beside it by a walled 0.5 m per m of lift, the other carriageway's ramp not counted as a road beside;
+- no retaining walls (a cut there is the model's), and none anywhere on another road's carriageway;
+- buildings: a machine-learned footprint on any carriageway, and a building or part a public road runs through for
+  3-15 m, left out;
+- signals, signs and poles stand on the ground at their own spot (everywhere, not only there).
+
+`BNE_DSM_MODE=on|off` forces it everywhere (default `auto`). `tools/road_audit.py --at lat,lon --compare` measures
+both: road bumpiness and grades per class, join steps, deck clearances over the roads under them.
+
+### Local elevation (`server/localdem.py`)
+A bare-earth model for a region, ahead of Mapterhorn: `<cache>/dem/local/<source>/N55E037.npy` (float32 1 x 1
+degree cells, row 0 north, NaN no data). `tools/fabdem_import.py` writes them from FABDEM V1-2's GeoTIFFs (Copernicus
+GLO-30 with buildings and forests removed; CC BY-NC-SA 4.0, non-commercial). A z ≥ 10 tile inside the cells is made
+from them alone (no ground filter), one at their edge blends into Mapterhorn over 48 px; the credits name FABDEM.
+`BNE_LOCAL_DEM=off`, or deleting the folder, goes back.
+
 ## Network (`server/netfetch.py`; docs/research/2026-10-10-rate-limits.md §5)
 
 Every download (DEM, imagery, weather, the EGM2008 archive) goes through one `netfetch.Fetcher`,
@@ -657,7 +684,10 @@ python3 server/airports.py --stats                                   # data-qual
 ## Tests
 
 ```sh
-python3 -m unittest discover -s server/tests -v        # BNGE_SKIP_DRIVE=1 skips the drive test
+tools/test.sh                     # every module but the slow end-to-end ones, 8 at once: ~5 min (discover: ~45)
+tools/test.sh grading dsm         # only these modules: seconds
+tools/test.sh --all               # every module (JOBS=4 for the timing tests: colormatch, credits' session)
+python3 -m unittest discover -s server/tests -v        # one by one; BNGE_SKIP_DRIVE=1 skips the drive test
 ```
 
 `test_airports.py`, `test_runwaygeom.py`, `test_runwaymarks.py`: the airport data (parsing, qualities, surfaces,

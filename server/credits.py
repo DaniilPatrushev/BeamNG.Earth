@@ -65,6 +65,7 @@ IMAGERY.update({n: v[1] for n, v in __import__("imagery_regional").REGIONAL.item
 ELEVATION = {
     demmod.MAPTERHORN["name"]: "Mapterhorn (see mapterhorn.com/attribution)",
     demmod.AWS["name"]: "AWS Terrain Tiles / Mapzen",
+    "local:fabdem": __import__("localdem").CREDIT,
 }
 WEATHER_ID = "wx:open-meteo"
 
@@ -85,6 +86,7 @@ SHORT = {
     "img:japan": "GSI Japan", "img:au_nsw": "Spatial Services NSW", "img:au_tas": "theLIST Tasmania",
     "img:ontario": "Ontario GEO",
     f"dem:{demmod.MAPTERHORN['name']}": "Mapterhorn", f"dem:{demmod.AWS['name']}": "AWS Terrain Tiles / Mapzen",
+    "dem:local:fabdem": "FABDEM",
     WEATHER_ID: "Open-Meteo",
 }
 # Every other source that built what is near the player (the user, 2026-10-18: "show all sources", not only those

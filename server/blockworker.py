@@ -21,6 +21,7 @@ import time
 import numpy as np
 
 import dem as demmod
+import dsmmode
 import farfield
 import geodesy
 import grading as gradingmod
@@ -43,6 +44,8 @@ class _State:
         self.imagery = None         # (its settings, imagery.Imagery from the disk alone): far_tile's textures
         net = netfetch.Fetcher(offline=offline)
         self.dem = demmod.Dem(os.path.join(cache_dir, "dem"), fetcher=net)
+        if os.environ.get("BNE_DSM_REGISTER"):     # (earthd's workers; not a test's)
+            dsmmode.register(self.dem)
         # runways graded in (--airports on): the copy the server loaded, never refreshed here
         self.airports = load_airports(cache_dir, self.dem) if airports else None
         md = mapdatamod.MapData(cache_dir, fetcher=net) if (roads or surface or sea) else None

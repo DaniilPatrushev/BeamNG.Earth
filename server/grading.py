@@ -27,6 +27,7 @@ import time
 
 import numpy as np
 
+import dsmmode
 import mapcells
 import roads as roadsmod
 
@@ -67,6 +68,33 @@ OVER_TUNNEL_SMALL_M = 0.5   # ... but for a change smaller than this (a road cro
 WALL_AHEAD_M = 2.5          # ... only beside a segment or this little past its end (a joint between two: VERTEX_STEP)
 RETRY_S = 60.0              # s before a cell whose road data failed is asked for again
 
+# Surface-model ground (dsmmode.is_dsm: no lidar, Copernicus GLO-30 through dsmground; Moscow, 2026-10-21: "the roads
+# are all crooked up and down"). The model's residual bumps (blocks and trees partly filtered, 1-2 m noise, a bilinear
+# kink every ~11 m pixel) have 30-150 m wavelengths, which SIGMA_M leaves in; its errors are mostly upward (canopy,
+# roofs). A profile there: a running lower quantile first, a longer Gaussian, then held under a grade limit.
+DSM_SIGMA_M = 45.0          # m, profile smoothing of built roads ...
+DSM_DIRT_SIGMA_M = 20.0     # ... and of gravel / dirt roads
+DSM_FLOOR_M = 90.0          # m: the running window of the lower quantile (on a straight grade: no bias) ...
+DSM_FLOOR_Q = 20.0          # ... its percentile
+DSM_MAJOR = {"motorway", "trunk", "primary", "secondary"}
+DSM_GRADE_MAJOR = 0.08      # steepest grade of a major road's profile ...
+DSM_GRADE_MINOR = 0.14      # ... and of the others
+# Junctions on such ground: roads are smoothed one by one, so two roads meeting (or the two ways of one street) had
+# their own heights there, a step blended over BLEND_R m. Each contact (an end on another road, a crossing at grade)
+# meets at one height: the higher class's, or between two of a class the mean, reached over a cosine ramp.
+DSM_SNAP_RUN_M = 120.0      # m along a road over which a contact's correction fades out
+DSM_SNAP_TOUCH_M = 2.0      # m past another road's core half width an end still touches it
+DSM_SNAP_MAX_M = 3.0        # m: a larger difference is no junction (a road under a high one the map has on the ground)
+RANK = {c: i for i, c in enumerate(("motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
+                                    "residential", "living_street", "unknown", "service", "track"))}
+# overpasses on such ground: its opening erased the approach embankments, so every class's approaches are raised
+DSM_APPROACH_SKIP = ()
+DSM_APPROACH_MAX_LIFT = 8.5     # m (roads.DECK_ROAD_CLEAR + 1: the abutment starts at the street's level)
+DSM_APPROACH_SIDE_RUN = 0.5     # m of fill per m of lift a ramp keeps from the roads beside it (a walled ramp: on a 1:2
+                                # slope the service roads along Leningradskoye shosse capped its overpasses' ramps to
+                                # nothing, decks 1.6 m over the road under them)
+NO_WALL_M = 1e9             # WALL_CUT_M where there are no retaining walls (surface-model ground: a "cut" is the model's)
+
 # Overpass approach ramps (from KyzoFox's 1.5.4, PR #64). A short bridge over a road had its ends on the ground on both
 # sides (the DEM is too coarse for the real approach embankments), and roads.deck_profile_once caps how steeply a deck
 # climbs from its ends: the deck over I-20 near Temple, GA reached ~2.5 m over the lanes (trucks hit it, 2026-10-19).
@@ -105,6 +133,164 @@ def smooth_profile(z, step, sigma):
     return np.convolve(pad, k, mode="valid")
 
 
+def lower_quantile(z, step, window, q):
+    """The running q-th percentile of a profile sampled every `step` m over a centred window of `window` m, the
+    profile point-reflected about its ends (repeated, a road's end on a slope took the low side's values: metres under
+    the street it meets). Pure."""
+    z = np.asarray(z, np.float64)
+    h = min(int(round(window / (2 * step))), len(z) - 1)
+    if len(z) < 3 or h < 1:
+        return z.copy()
+    pad = np.r_[2 * z[0] - z[h:0:-1], z, 2 * z[-1] - z[-2:-h - 2:-1]]
+    win = np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1)
+    return np.percentile(win, q, axis=1)
+
+
+def _grade_envelope(z, step, grade, op):
+    """The highest profile under z (op min) or the lowest over it (op max) that climbs or falls no steeper than
+    grade. Pure."""
+    z = np.asarray(z, np.float64).copy()
+    d = grade * step if op is min else -grade * step
+    for i in range(1, len(z)):
+        z[i] = op(z[i], z[i - 1] + d)
+    for i in range(len(z) - 2, -1, -1):
+        z[i] = op(z[i], z[i + 1] + d)
+    return z
+
+
+def grade_limit(z, step, grade):
+    """Profile z (sampled every `step` m) no steeper than grade anywhere: the mean of the highest profile under it
+    and the lowest over it that keep to the grade (a spike or a pit becomes a gentle hump or dip half its height, a
+    profile already within the grade stays as it is). Pure."""
+    return 0.5 * (_grade_envelope(z, step, grade, min) + _grade_envelope(z, step, grade, max))
+
+
+def dsm_profile(z, step, spec):
+    """A road's profile (raw DEM every `step` m) on surface-model ground: see DSM_SIGMA_M. Pure."""
+    built = spec.kind in roadsmod.BUILT
+    zl = lower_quantile(z, step, DSM_FLOOR_M, DSM_FLOOR_Q)
+    # point-reflected at the ends (roads._smooth_pinned): mirrored, a road climbing to its end was smoothed to a height
+    # metres under it there, and the junction snap pulled it back up in a few metres (a 2.7 m step in 20 m)
+    zs = roadsmod._smooth_pinned(zl, step, DSM_SIGMA_M if built else DSM_DIRT_SIGMA_M)
+    return grade_limit(zs, step, DSM_GRADE_MAJOR if spec.cls in DSM_MAJOR else DSM_GRADE_MINOR)
+
+
+def _arcs(xy):
+    return np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy[:, :2], axis=0).T))]
+
+
+def _nearest(line, s_line, q):
+    """(distance m, arc m along line) of the point of polyline line (k, 2) nearest each point q (m, 2). Pure."""
+    a, b = line[:-1, :2], line[1:, :2]
+    ab = b - a
+    L2 = np.maximum((ab * ab).sum(1), 1e-12)
+    t = np.clip(((q[:, None, :] - a[None]) * ab[None]).sum(2) / L2[None], 0.0, 1.0)
+    d = np.hypot(*(q[:, None, :] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1))
+    k = d.argmin(1)
+    r = np.arange(len(q))
+    return d[r, k], s_line[k] + t[r, k] * np.sqrt(L2[k])
+
+
+def _seg_crossings(p, q):
+    """[(arc on p, arc on q)] where polylines p (k, 2) and q (m, 2) cross. Pure."""
+    a, b = p[:-1, None, :2], p[1:, None, :2]
+    c, d = q[None, :-1, :2], q[None, 1:, :2]
+    r, s_ = b - a, d - c
+    den = r[..., 0] * s_[..., 1] - r[..., 1] * s_[..., 0]
+    ok = np.abs(den) > 1e-12
+    den = np.where(ok, den, 1.0)
+    w = c - a
+    t = (w[..., 0] * s_[..., 1] - w[..., 1] * s_[..., 0]) / den
+    u = (w[..., 0] * r[..., 1] - w[..., 1] * r[..., 0]) / den
+    hit = ok & (t >= 0.0) & (t <= 1.0) & (u >= 0.0) & (u <= 1.0)
+    i, j = np.nonzero(hit)
+    if not len(i):
+        return []
+    sp, sq = _arcs(p), _arcs(q)
+    lp = np.hypot(*(p[1:, :2] - p[:-1, :2]).T)
+    lq = np.hypot(*(q[1:, :2] - q[:-1, :2]).T)
+    return list(zip(sp[i] + t[i, j] * lp[i], sq[j] + u[i, j] * lq[j]))
+
+
+def snap_profile(p, spec, ends, others, run=DSM_SNAP_RUN_M):
+    """Plan p's heights with its contacts met (see DSM_SNAP_RUN_M), or None when nothing changes. spec: its Spec;
+    ends: (start, end) are road ends (not cut); others: [(Plan, Spec, ends)] of the roads around (raw plans). At a
+    contact with a road of a higher class (RANK) p takes that road's height, with one of its own class the mean of the
+    two, with a lower one it keeps its own (the other road comes to it). Between contacts the corrections are blended,
+    beyond the outer ones they fade out over `run` m. Pure."""
+    xy = p.xy[:, :2]
+    if len(xy) < 2:
+        return None
+    sp = _arcs(xy)
+    r1 = RANK.get(spec.cls, RANK["unknown"])
+    x0, y0, x1, y1 = p.bbox
+    found = []          # (arc on p, target height)
+    for p2, spec2, ends2 in others:
+        r2 = RANK.get(spec2.cls, RANK["unknown"])
+        if r2 > r1 or len(p2.xy) < 2:
+            continue
+        b = p2.bbox
+        if b[0] > x1 or b[2] < x0 or b[1] > y1 or b[3] < y0:
+            continue
+        q = p2.xy[:, :2]
+        sq = _arcs(q)
+        pairs = []      # (arc on p, arc on p2)
+        for at_end, real in ((False, ends[0]), (True, ends[1])):
+            if not real:
+                continue
+            e = xy[-1:] if at_end else xy[:1]
+            d, a2 = _nearest(q, sq, e)
+            if d[0] <= p2.half + DSM_SNAP_TOUCH_M:
+                pairs.append((sp[-1] if at_end else 0.0, float(a2[0])))
+        for at_end, real in ((False, ends2[0]), (True, ends2[1])):
+            if not real:
+                continue
+            e = q[-1:] if at_end else q[:1]
+            d, a1 = _nearest(xy, sp, e)
+            if d[0] <= p.half + DSM_SNAP_TOUCH_M:
+                pairs.append((float(a1[0]), sq[-1] if at_end else 0.0))
+        pairs += _seg_crossings(xy, q)
+        for a1, a2 in pairs:
+            z1 = float(np.interp(a1, sp, p.z))
+            z2 = float(np.interp(a2, sq, p2.z))
+            if abs(z2 - z1) > DSM_SNAP_MAX_M:
+                continue
+            found.append((a1, z2 if r2 < r1 else 0.5 * (z1 + z2)))
+    if not found:
+        return None
+    found.sort()
+    nodes, deltas = [], []
+    for a1, zt in found:                    # contacts closer than 5 m: one (the first, in arc order)
+        if nodes and a1 - nodes[-1] < 5.0:
+            continue
+        nodes.append(a1)
+        deltas.append(zt - float(np.interp(a1, sp, p.z)))
+    nodes, deltas = np.asarray(nodes), np.asarray(deltas)
+    if np.abs(deltas).max() < 0.01:
+        return None
+    corr = np.zeros(len(sp))
+
+    def smooth(u):
+        u = np.clip(u, 0.0, 1.0)
+        return u * u * (3.0 - 2.0 * u)
+    for j in range(len(nodes)):             # fading out on either side of each node ...
+        left = sp <= nodes[j]
+        right = ~left
+        if j == 0:
+            corr[left] = deltas[j] * (1.0 - smooth((nodes[j] - sp[left]) / run))
+        if j == len(nodes) - 1:
+            corr[right] = deltas[j] * (1.0 - smooth((sp[right] - nodes[j]) / run))
+    for j in range(len(nodes) - 1):         # ... blended between two nodes (both faded where they are far apart)
+        m = (sp > nodes[j]) & (sp <= nodes[j + 1])
+        gap = nodes[j + 1] - nodes[j]
+        if gap <= 2 * run:
+            corr[m] = deltas[j] + (deltas[j + 1] - deltas[j]) * smooth((sp[m] - nodes[j]) / max(gap, 1e-6))
+        else:
+            corr[m] = deltas[j] * (1.0 - smooth((sp[m] - nodes[j]) / run)) \
+                + deltas[j + 1] * (1.0 - smooth((nodes[j + 1] - sp[m]) / run))
+    return p.z + corr
+
+
 def resample(xy, step):
     """Points every `step` m along a polyline (xy (k, 2)), the last point kept, and their arc lengths."""
     import fast
@@ -120,10 +306,10 @@ def resample(xy, step):
 
 class Plan:
     """One road's grading: vertices (n, 2) in the frame's ENU metres, their target heights, core half width."""
-    __slots__ = ("xy", "z", "half", "bbox")
+    __slots__ = ("xy", "z", "half", "bbox", "dsm")
 
-    def __init__(self, xy, z, half):
-        self.xy, self.z, self.half = xy, z, float(half)
+    def __init__(self, xy, z, half, dsm=False):
+        self.xy, self.z, self.half, self.dsm = xy, z, float(half), bool(dsm)
         pad = half + T_MAX
         self.bbox = (xy[:, 0].min() - pad, xy[:, 1].min() - pad, xy[:, 0].max() + pad, xy[:, 1].max() + pad)
 
@@ -175,13 +361,14 @@ def clip_polyline(xy, box):
     return [np.array(r, np.float64) for r in runs if len(r) >= 2]
 
 
-def plan_road(frame, lonlat, spec, elev):
+def plan_road(frame, lonlat, spec, elev, dsm=False):
     """The Plan of one road part (lonlat (k, 2)); elev(lat, lon) -> m at PROFILE_ZOOM. Pure given elev."""
-    return plan_roads(frame, [(lonlat, spec)], elev)[0]
+    return plan_roads(frame, [(lonlat, spec)], elev, dsm)[0]
 
 
-def plan_roads(frame, parts, elev):
-    """plan_road for many (lonlat, spec) parts with one elev call (its cost is per call). Pure given elev."""
+def plan_roads(frame, parts, elev, dsm=False):
+    """plan_road for many (lonlat, spec) parts with one elev call (its cost is per call); dsm: surface-model ground
+    (dsm_profile). Pure given elev."""
     if not parts:
         return []
     ll = np.concatenate([lonlat for lonlat, _ in parts])
@@ -205,19 +392,20 @@ def plan_roads(frame, parts, elev):
             continue
         z = zall[k:k + len(xy)]
         k += len(xy)
-        out.append(_plan(xy, z, spec))
+        out.append(_plan(xy, z, spec, dsm))
     return out
 
 
-def _plan(xy, z, spec):
+def _plan(xy, z, spec, dsm=False):
     built = spec.kind in roadsmod.BUILT
-    zs = smooth_profile(z, PROFILE_STEP, SIGMA_M if built else DIRT_SIGMA_M)
+    zs = dsm_profile(z, PROFILE_STEP, spec) if dsm else smooth_profile(z, PROFILE_STEP,
+                                                                        SIGMA_M if built else DIRT_SIGMA_M)
     # thin to VERTEX_STEP (the profile stays smooth between: linear in the grading pass)
     every = max(1, int(round(VERTEX_STEP / PROFILE_STEP)))
     keep = np.r_[np.arange(0, len(xy) - 1, every), len(xy) - 1]
     # the carriageway as a city street would have it (never from the land cover), or the measured one
     width = max(spec.width, roadsmod.carriageway(spec.cls, spec.kind, True, None, spec.oneway)) if built else spec.width
-    return Plan(xy[keep], zs[keep], width / 2 + shoulder(spec))
+    return Plan(xy[keep], zs[keep], width / 2 + shoulder(spec), dsm)
 
 
 def shoulder(spec):
@@ -270,24 +458,18 @@ class Grader:
             return []
         plans = []
         if feats is not None and len(feats):
-            specs = roadsmod.road_specs(feats, None, self.widths)
-            parts, ids = [], []
-            box = self._clip_box(key)
-            for i in range(len(feats)):
-                if specs[i] is None:
-                    continue
-                for ring in roadsmod.ground_parts(feats, i):     # not bridges / tunnels
-                    for r in self._near_cell(np.asarray(ring, np.float64), box):
-                        parts.append((r, specs[i]))
-                        ids.append(str(feats.ids[i]))
-            pspecs = []
-            for fid, part, p in zip(ids, parts, plan_roads(self.frame, parts, self.elev)):
-                if p is not None:
-                    plans.append((fid, p))
-                    pspecs.append(part[1])
+            dsm = self._dsm(key)
+            raw = self._raw_plans(key, feats)
+            plans = [(fid, p) for fid, p, _sp, _ends in raw]
+            pspecs = [sp for _fid, _p, sp, _ends in raw]
+            if dsm and plans:
+                try:
+                    plans = self._snap_junctions(raw)
+                except Exception as e:      # unsnapped junctions rather than no grading
+                    log.debug("grading: junctions of %s: %s: %s", key, type(e).__name__, e)
             if APPROACH_ON and plans:
                 try:
-                    self._lift_approaches(key, plans, pspecs)
+                    self._lift_approaches(key, plans, pspecs, dsm)
                 except Exception as e:      # ungraded approaches rather than no grading
                     log.debug("grading: approaches of %s: %s: %s", key, type(e).__name__, e)
             secs = self._tunnel_sections(feats, key, [p for _f, p in plans])
@@ -303,6 +485,122 @@ class Grader:
             self.covers.setdefault(key, covers)
             self.opens.setdefault(key, opens)
             return self.cells[key]
+
+    def _dsm(self, key):
+        """Is cell key's ground a surface model (dsmmode.is_dsm at its centre)?"""
+        if not hasattr(key, "center"):
+            return dsmmode.mode() == "on"
+        return dsmmode.is_dsm(*key.center())
+
+    def _raw_plans(self, key, feats=None):
+        """[(fid, Plan, Spec, (start is a road end, end is a road end))] of cell key's ground roads as planned before
+        any junction, approach or tunnel work, made once (the junction snap reads the neighbouring cells' too). An end
+        cut by _near_cell is no road end."""
+        with self.lock:
+            if not hasattr(self, "raw"):
+                self.raw = {}
+                self.raw_locks = {}
+            got = self.raw.get(key)
+            kl = self.raw_locks.setdefault(key, threading.Lock())
+        if got is not None:
+            return got
+        with kl:
+            with self.lock:
+                got = self.raw.get(key)
+            if got is not None:
+                return got
+            if feats is None:
+                try:
+                    feats = self.md.cell(key, layers=("roads",), kind="demand").layers.get("roads")
+                except Exception as e:
+                    log.debug("grading: raw roads of %s: %s: %s", key, type(e).__name__, e)
+                    return []
+            out = []
+            if feats is not None and len(feats):
+                dsm = self._dsm(key)
+                specs = roadsmod.road_specs(feats, None, self.widths)
+                parts, ids, ends = [], [], []
+                box = self._clip_box(key)
+                for i in range(len(feats)):
+                    if specs[i] is None:
+                        continue
+                    for ring in roadsmod.ground_parts(feats, i):     # not bridges / tunnels
+                        ring = np.asarray(ring, np.float64)
+                        for r in self._near_cell(ring, box):
+                            parts.append((r, specs[i]))
+                            ids.append(str(feats.ids[i]))
+                            ends.append((bool(np.array_equal(r[0], ring[0])), bool(np.array_equal(r[-1], ring[-1]))))
+                for fid, part, e, p in zip(ids, parts, ends, plan_roads(self.frame, parts, self.elev, dsm)):
+                    if p is not None:
+                        out.append((fid, p, part[1], e))
+            with self.lock:
+                if len(self.raw) > 256:
+                    self.raw.clear()
+                return self.raw.setdefault(key, out)
+
+    def _snap_junctions(self, raw):
+        """raw's plans (see _raw_plans) with every contact met at one height (DSM_SNAP_RUN_M). The other roads at a
+        contact come from the raw plans of the cells the road passes through, so every cell that plans a road snaps
+        it the same way. Returns [(fid, Plan)]."""
+        out = []
+        for fid, p, sp, ends in raw:
+            z = self._snapped_z(fid, p, sp, ends) if len(p.xy) >= 2 else None
+            out.append((fid, p if z is None else Plan(p.xy, z, p.half, p.dsm)))
+        return out
+
+    def _boxes(self, k):
+        """(raw plans of cell k, their bboxes (n, 4)), made once."""
+        with self.lock:
+            if not hasattr(self, "box_cache"):
+                self.box_cache = {}
+            got = self.box_cache.get(k)
+        if got is not None:
+            return got
+        rp = self._raw_plans(k)
+        bb = np.array([p.bbox for _f, p, _s, _e in rp], np.float64).reshape(-1, 4)
+        with self.lock:
+            if len(self.box_cache) > 256:
+                self.box_cache.clear()
+            return self.box_cache.setdefault(k, (rp, bb))
+
+    def _snapped_z(self, fid, p, sp, ends, depth=0):
+        """Plan p's heights snapped at its contacts (snap_profile), None when unchanged, made once per plan. The roads
+        of a higher class it meets count with their own snapped heights (a service road on a street that is itself
+        pulled to an avenue meets the street where it is), those of its class with their raw ones (the mean of the
+        two: the same from either side)."""
+        mk = (fid, float(p.xy[0, 0]), float(p.xy[0, 1]), len(p.xy))
+        with self.lock:
+            if not hasattr(self, "snap_cache"):
+                self.snap_cache = {}
+            if mk in self.snap_cache:
+                return self.snap_cache[mk]
+        la, lo, _ = self.frame.enu_to_geodetic(p.xy[:, 0], p.xy[:, 1], 0.0)
+        keys = sorted({mapcells.cell_of(float(a), float(b)) for a, b in zip(np.asarray(la), np.asarray(lo))}, key=str)
+        r1 = RANK.get(sp.cls, RANK["unknown"])
+        x0, y0, x1, y1 = p.bbox
+        others, seen = [], set()
+        for k in keys:
+            rp, bb = self._boxes(k)
+            if not len(rp):
+                continue
+            near = np.flatnonzero((bb[:, 0] <= x1) & (bb[:, 2] >= x0) & (bb[:, 1] <= y1) & (bb[:, 3] >= y0))
+            for j in near.tolist():
+                f2, p2, sp2, e2 = rp[j]
+                kk = (f2, float(p2.xy[0, 0]), float(p2.xy[0, 1]), len(p2.xy))
+                r2 = RANK.get(sp2.cls, RANK["unknown"])
+                if f2 == fid or kk in seen or r2 > r1 or len(p2.xy) < 2:
+                    continue
+                seen.add(kk)
+                if r2 < r1 and depth < len(RANK):
+                    z2 = self._snapped_z(f2, p2, sp2, e2, depth + 1)
+                    if z2 is not None:
+                        p2 = Plan(p2.xy, z2, p2.half, p2.dsm)
+                others.append((p2, sp2, e2))
+        z = snap_profile(p, sp, ends, others)
+        with self.lock:
+            if len(self.snap_cache) > 200000:
+                self.snap_cache.clear()
+            return self.snap_cache.setdefault(mk, z)
 
     def _clip_box(self, key):
         """The cell's box in the frame (east / north), CLIP_MARGIN_M wider each side; None for a key without bounds."""
@@ -333,7 +631,7 @@ class Grader:
             out.append(np.stack([np.asarray(lo, np.float64), np.asarray(la, np.float64)], axis=1))
         return out
 
-    def _lift_approaches(self, key, plans, specs):
+    def _lift_approaches(self, key, plans, specs, dsm=False):
         """Raise, in place, the plans of the roads leading onto overpasses (APPROACH_ON). A road is raised where one of
         its ends is a bridge's abutment that must go up for the deck to clear the road under it (_end_lift); the raise
         falls off along the road (approach_add) and never comes nearer another road than its fill slope allows. Only
@@ -347,7 +645,8 @@ class Grader:
         lon0, lat0, lon1, lat1 = (float(v) for v in key.bounds())
         dla = np.maximum(np.maximum(lat0 - la, la - lat1), 0.0) * 111320.0
         dlo = np.maximum(np.maximum(lon0 - lo, lo - lon1), 0.0) * 111320.0 * np.cos(np.radians(la))
-        ok = np.repeat([s is not None and s.cls not in APPROACH_SKIP and not _is_link(s) for s in specs], 2)
+        skip = DSM_APPROACH_SKIP if dsm else APPROACH_SKIP
+        ok = np.repeat([s is not None and s.cls not in skip and (dsm or not _is_link(s)) for s in specs], 2)
         touch = ok & (np.hypot(dla, dlo) <= APPROACH_CELL_M)
         homes = {}
         for j in np.flatnonzero(touch):
@@ -373,11 +672,15 @@ class Grader:
                 if got is None:
                     continue
                 lift, others = got
-                a = approach_add(p.xy, at_end, lift, p.half, others)
+                if not dsm:
+                    lift = min(lift, APPROACH_MAX_LIFT)
+                # on a surface model the ramps beside go up too (no caps from them); elsewhere every road beside caps
+                others = [(ln, h) for ln, h, ramp in others if not (dsm and ramp)]
+                a = approach_add(p.xy, at_end, lift, p.half, others, DSM_APPROACH_SIDE_RUN if dsm else None)
                 if a is not None:
                     add = a if add is None else np.maximum(add, a)
             if add is not None:
-                plans[i] = (fid, Plan(p.xy, p.z + add, p.half))
+                plans[i] = (fid, Plan(p.xy, p.z + add, p.half, p.dsm))
 
     def _end_lift(self, xy):
         """(lift m, other road lines [(xy (k, 2), half width)]) when the road end xy is a bridge abutment to raise, else
@@ -462,6 +765,7 @@ class Grader:
         lo_b, hi_b = bridge.min(0) - APPROACH_MAX_RUN - 50.0, bridge.max(0) + APPROACH_MAX_RUN + 50.0
         ground, others, seen = [], [], set()
         blo, bhi = bridge.min(0), bridge.max(0)
+        b_ends = np.array([b[k] for b in bridges for k in (0, -1)], np.float64).reshape(-1, 2)
         for c in cs:
             for line, half, _cls in c["ground"]:
                 key = (round(float(line[0, 0]), 1), round(float(line[0, 1]), 1), len(line))
@@ -477,12 +781,17 @@ class Grader:
                 # the roads beside the ramp, which its fill slope must not reach (not the ones the bridge spans: its
                 # abutment stands between)
                 if not touches and not under:
-                    others.append((line, half))
+                    # (a ramp itself: its end on another bridge's end, a divided road's other carriageway going up
+                    # beside this one)
+                    ramp = bool(len(b_ends)) and min(
+                        float(np.hypot(*(b_ends - line[0]).T).min()),
+                        float(np.hypot(*(b_ends - line[-1]).T).min())) <= APPROACH_TOUCH_M
+                    others.append((line, half, ramp))
 
         def z_at(p):
             la_, lo_, _ = self.frame.enu_to_geodetic(p[:, 0], p[:, 1], 0.0)
             return np.asarray(self.elev(la_, lo_), np.float64)
-        for end, lift in bridge_lifts(bridge, bridges, ground, z_at):
+        for end, lift in bridge_lifts(bridge, bridges, ground, z_at, DSM_APPROACH_MAX_LIFT):
             if np.hypot(*(end - xy)) <= APPROACH_TOUCH_M:
                 return lift, others
         return None
@@ -734,6 +1043,7 @@ def grade_points(px, py, base, plans, lift=0.0):
     sk = key[order]
     # every segment of the plans near the points: ends, end heights, reach (core half width + T_MAX)
     A, B, ZA, ZB, H = [], [], [], [], []
+    wall_cut = WALL_CUT_M
     for p in plans:
         if p.bbox[2] < x0 or p.bbox[0] > x1 or p.bbox[3] < y0 or p.bbox[1] > y1 or len(p.xy) < 2:
             continue
@@ -742,6 +1052,8 @@ def grade_points(px, py, base, plans, lift=0.0):
         ZA.append(p.z[:-1])
         ZB.append(p.z[1:])
         H.append(np.full(len(p.xy) - 1, p.half))
+        if getattr(p, "dsm", False):
+            wall_cut = NO_WALL_M        # (roads.retaining_walls draws none there either)
     if not A:
         return out
     A, B, ZA, ZB, H = (np.concatenate(v) for v in (A, B, ZA, ZB, H))
@@ -753,7 +1065,7 @@ def grade_points(px, py, base, plans, lift=0.0):
                                      np.ascontiguousarray(B[:, :2], f64), np.ascontiguousarray(ZA, f64),
                                      np.ascontiguousarray(ZB, f64), np.ascontiguousarray(H, f64), float(lift),
                                      float(SLOPE_RUN), float(T_MIN), float(T_MAX), float(BLEND_R), float(BUCKET),
-                                     float(WALL_CUT_M), float(WALL_T_M), float(WALL_FLAT_M), float(WALL_AHEAD_M))
+                                     float(wall_cut), float(WALL_T_M), float(WALL_FLAT_M), float(WALL_AHEAD_M))
     reach = H + T_MAX
     lo_x = np.minimum(A[:, 0], B[:, 0]) - reach
     hi_x = np.maximum(A[:, 0], B[:, 0]) + reach
@@ -798,7 +1110,7 @@ def grade_points(px, py, base, plans, lift=0.0):
         side = np.abs(qx * ab[:, 1] - qy * ab[:, 0]) / Lab
         along = (qx * ab[:, 0] + qy * ab[:, 1]) / Lab
         ahead = np.maximum(np.maximum(-along, along - Lab), 0.0)
-        wall = (base[idx] - target > WALL_CUT_M) & (ahead < side) & (ahead < WALL_AHEAD_M)
+        wall = (base[idx] - target > wall_cut) & (ahead < side) & (ahead < WALL_AHEAD_M)
         T = np.where(wall, WALL_T_M, np.clip(SLOPE_RUN * np.abs(target - base[idx]), T_MIN, T_MAX))
         u = np.clip((d - H[s_] - np.where(wall, WALL_FLAT_M, 0.0)) / T, 0.0, 1.0)
         w = 1.0 - u * u * (3.0 - 2.0 * u)           # 1 on the core, smooth to 0 over T
@@ -818,13 +1130,14 @@ def grade_points(px, py, base, plans, lift=0.0):
     return out
 
 
-def bridge_lifts(line, all_bridges, ground_lines, z_at):
+def bridge_lifts(line, all_bridges, ground_lines, z_at, max_lift=None):
     """[(end xy (2,), lift m)] of a bridge part (line (k, 2) ENU m): at each of its ends that no other bridge part
     continues from (an abutment), how far the ground there must be raised for the deck to clear every road crossing
     under it (roads.DECK_ROAD_CLEAR + APPROACH_MARGIN_M over the road, full height within APPROACH_FLAT_M of the end,
     then falling at roads.DECK_GRADE), within [APPROACH_MIN_LIFT, APPROACH_MAX_LIFT]. Roads crossing within
     APPROACH_MIN_CROSS_M of either end meet it at grade and do not count. z_at(xy (n, 2)) -> ground m. Pure given
-    z_at."""
+    z_at. max_lift: instead of APPROACH_MAX_LIFT."""
+    max_lift = APPROACH_MAX_LIFT if max_lift is None else max_lift
     line = np.asarray(line, np.float64)[:, :2]
     if len(line) < 2:
         return []
@@ -857,11 +1170,11 @@ def bridge_lifts(line, all_bridges, ground_lines, z_at):
             - roadsmod.DECK_GRADE * np.maximum(d - APPROACH_FLAT_M, 0.0)
         lift = float(need.max() - z_at(end[None])[0])
         if lift >= APPROACH_MIN_LIFT:
-            out.append((np.asarray(end, np.float64), min(lift, APPROACH_MAX_LIFT)))
+            out.append((np.asarray(end, np.float64), min(lift, max_lift)))
     return out
 
 
-def approach_add(xy, at_end, lift, half, others=()):
+def approach_add(xy, at_end, lift, half, others=(), side_run=None):
     """m to add to a road plan's vertices (xy (n, 2)) rising to `lift` at its first (at_end False) or last vertex (a
     bridge's abutment), falling off along the road (arc length) on a cosine ramp whose steepest grade is APPROACH_GRADE;
     at most what keeps the fill slope (SLOPE_RUN) clear of the other roads [(line (k, 2), half width)] beside it, with
@@ -883,7 +1196,8 @@ def approach_add(xy, at_end, lift, half, others=()):
         line = np.asarray(line, np.float64)[:, :2]
         if len(line) < 2:
             continue
-        reach = half + oh + APPROACH_GAP_M + SLOPE_RUN * lift
+        run_ = SLOPE_RUN if side_run is None else side_run
+        reach = half + oh + APPROACH_GAP_M + run_ * lift
         if (line.max(0) < lo_q - reach).any() or (line.min(0) > hi_q + reach).any():
             continue                    # too far to matter
         q = xy[on]
@@ -892,7 +1206,7 @@ def approach_add(xy, at_end, lift, half, others=()):
         L2 = np.maximum((ab * ab).sum(1), 1e-12)
         t = np.clip(((q[:, None, :] - a[None]) * ab[None]).sum(2) / L2[None], 0.0, 1.0)
         dist = np.hypot(*(q[:, None, :] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1)).min(1)
-        cap = np.maximum(0.0, (dist - half - oh - APPROACH_GAP_M) / SLOPE_RUN)
+        cap = np.maximum(0.0, (dist - half - oh - APPROACH_GAP_M) / run_)
         add[on] = np.minimum(add[on], cap)
     # a cap lowers the ramp before it at APPROACH_CAP_GRADE at most, instead of a step at the cap
     for i in range(1, len(add)):

@@ -305,6 +305,7 @@ def build(frame, feats_list, elev, centre, urban_fn=None, window=WINDOW_M, decks
             e[5] = min(e[5], round(RING_MS, 2))
     # keep the edges with both ends in the window; z of their nodes from the ground
     inside = {nm for nm, (x, y) in pending.items() if abs(x - cx) <= window and abs(y - cy) <= window}
+    on_deck = set()         # nodes at a deck's height
     edges = [e for e in edges if e[0] in inside and e[1] in inside]
     used = sorted({e[0] for e in edges} | {e[1] for e in edges})
     if used:
@@ -317,13 +318,18 @@ def build(frame, feats_list, elev, centre, urban_fn=None, window=WINDOW_M, decks
                 dz = _deck_z(decks, node_fid.get(nm), X[k], Y[k])
                 if dz is not None:
                     Z[k] = dz
+                    on_deck.add(nm)
         radius = {}
         for e in edges:
             for nm in e[:2]:
                 radius[nm] = max(radius.get(nm, 0.0), e[7])
         for nm, x, y, z in zip(used, X, Y, Z):
             nodes[nm] = [round(float(x), 2), round(float(y), 2), round(float(z), 2), radius[nm]]
-    signals = _signals(prop_arms, approaches, nodes, left_hand, set(ring))
+    def ground(xy):         # the ground under the signal heads' props
+        la_, lo_, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+        return np.asarray(elev(la_, lo_), np.float64)
+    signals = _signals(prop_arms, approaches, {k: v for k, v in nodes.items() if k not in on_deck}, left_hand,
+                       set(ring), ground)
     # one edge per node pair (two segments joining the same connectors: keep the first)
     uniq, pairs = [], set()
     for e in edges:
@@ -341,7 +347,7 @@ STOP_BACK_M = 2.0           # the stop point: this far before the junction's wid
 SHORT_APPROACH_M = 15.0
 
 
-def _signals(arms, approaches, nodes, left_hand=False, ring=None):
+def _signals(arms, approaches, nodes, left_hand=False, ring=None, ground=None):
     """[{"j": junction node, "kind": "signal" | "stop", "app": [[approach node, x, y, z, dir x, dir y, phase, prop x,
     prop y, prop z, prop yaw]]}] of the urban junctions furniture.junction_controls controls, decided on the arms
     the road tiles' props see (arms) and built for the graph's approaches into them (approaches): per incoming
@@ -386,6 +392,14 @@ def _signals(arms, approaches, nodes, left_hand=False, ring=None):
                         round(furniture._yaw(right[0], right[1]), 1)])
         if app:
             out.append({"j": name, "kind": kind, "app": app})
+    if ground is not None and out:
+        # each head's prop on the ground where it stands, not at the junction's height (it stands up to ~15 m out:
+        # on an embankment's fill slope or a graded approach it floated; Moscow, 2026-10-21)
+        a = [x for o in out for x in o["app"]]
+        g = np.asarray(ground(np.array([[x[7], x[8]] for x in a], np.float64)), np.float64)
+        for x, gz in zip(a, g):
+            if np.isfinite(gz):
+                x[9] = round(float(gz) + 0.15, 2)
     return out
 
 

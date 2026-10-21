@@ -246,7 +246,21 @@ def _seg_dist_min(p, line):
     return float(np.hypot(*(a + t[:, None] * d - p).T).min())
 
 
-def junction_props(roads, box, curb_h=0.15, left_hand=False):
+def _on_ground(rows, ground, add=0.0):
+    """rows' z (index 3) set to the ground at their x, y (+ add), in place; ground: (n, 2) -> heights in the frame,
+    or None (rows kept). A prop stood at the height of the road point it was placed from (a junction's centre, the
+    centreline beside it): several metres off on an embankment's fill slope or a graded approach, so signals and
+    poles floated (Moscow, 2026-10-21)."""
+    if ground is None or not rows:
+        return rows
+    z = np.asarray(ground(np.array([[r[1], r[2]] for r in rows], np.float64)), np.float64)
+    for r, zz in zip(rows, z):
+        if np.isfinite(zz):
+            r[3] = round(float(zz) + add, 2)
+    return rows
+
+
+def junction_props(roads, box, curb_h=0.15, left_hand=False, ground=None):
     """Signals at urban junctions of two or more major roads (every arm), stop signs at urban junctions
     of minor roads (the minor arms meeting a major road; the stem of a T; half the four-way ones, hashed).
     Each on the approach's right (its left where traffic drives on the left), at the junction's edge, facing
@@ -279,7 +293,7 @@ def junction_props(roads, box, curb_h=0.15, left_hand=False):
                 continue
             rows.append([what, round(float(q[0]), 2), round(float(q[1]), 2), round(float(c[2] + curb_h), 2),
                          round(_yaw(right[0], right[1]), 1), 1.0, 9.4 if what == G_SIGNAL else 3.0, 0.0])
-    return rows
+    return _on_ground(rows, ground, curb_h)
 
 
 SIGN_MPH = (30, 40, 50, 60, 70)     # speed-limit sign models (trees.lua: Utah's ut_<n>_speed_limit)
@@ -292,7 +306,7 @@ SIGN_IN_M = 30.0            # m past the junction
 SIGN_OFF_M = 1.5            # m beyond the carriageway's edge
 
 
-def speed_signs(roads, speeds, box, left_hand=False, mph_signs=True):
+def speed_signs(roads, speeds, box, left_hand=False, mph_signs=True, ground=None):
     """mph: the country posts mph (else the km/h models). Prop rows of speed-limit signs: on two-way roads of SIGN_CLASSES whose limit (speeds: fid -> mph, the
     road graph's) has a sign model, SIGN_IN_M after each end of a segment of at least SIGN_MIN_M, on the kerb
     side of the traffic leaving that end, facing it."""
@@ -321,7 +335,7 @@ def speed_signs(roads, speeds, box, left_hand=False, mph_signs=True):
             if x0 <= q[0] < x1 and y0 <= q[1] < y1:
                 rows.append([group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[0][2]), 2),
                              round(_yaw(side[0], side[1]), 1), 1.0, 2.6, 0.0])
-    return rows
+    return _on_ground(rows, ground)
 
 
 G_HYDRANT, G_BENCH, G_BIN = "hydrant", "bench", "bin"
@@ -414,11 +428,20 @@ def under_decks(rows, decks, wires=None):
     return out
 
 
-def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=False, speeds=None, mph=True, decks=()):
+def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=False, speeds=None, mph=True, decks=(),
+          ground=None):
     """Rows [group, x, y, z, yaw, scale, height, rank] (trees.lua's tile rows) of the lamps and poles of a
     tile box (x0, y0, x1, y1). roads: build_tile's (fid, spec, centreline (k, 3), lon); walks: its sidewalk
     runs (dicts with fid, pts, side, w); decks: the bridge decks over the tile [(centreline (k, 3), half
-    width)]: nothing tall under them (under_decks)."""
+    width)]: nothing tall under them (under_decks); ground: (n, 2) -> the ground's heights there (the signals, signs
+    and poles stand on it; None: at their road's height)."""
+
+    def on_ground(q, z):
+        """Heights of the points q (n, 2): the ground's (ground), else z."""
+        if ground is None or not len(q):
+            return np.asarray(z, np.float64)
+        g = np.asarray(ground(np.asarray(q, np.float64)[:, :2]), np.float64)
+        return np.where(np.isfinite(g), g, np.asarray(z, np.float64))
     x0, y0, x1, y1 = box
     by_fid = {fid: (spec, pts) for fid, spec, pts, _ in roads}
     import fast
@@ -452,8 +475,11 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 lit.add(fid)
                 run_poles = []
                 ph = _h01(fid, "tphase") * TOWN_POLE_SPACING
-                for p, out in _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side):
-                    q = p[:2] - out * (w / 2 - 0.6)
+                st = _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side)
+                qs = np.array([p[:2] - out * (w / 2 - 0.6) for p, out in st], np.float64).reshape(-1, 2)
+                zs = on_ground(qs, [p[2] for p, _out in st])
+                for (p, out), q, zq in zip(st, qs, zs):
+                    p = np.array([p[0], p[1], zq])
                     yaw = _yaw(out[0], out[1])
                     run_poles.append((float(q[0]), float(q[1]), float(p[2]), yaw))
                     if x0 <= q[0] < x1 and y0 <= q[1] < y1:
@@ -493,9 +519,9 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             put(G_BENCH, BENCH_SPACING, _h01(fid, side, "bench") * BENCH_SPACING, w - 0.45, 0.9,
                 lambda out: _yaw(-out[0], -out[1]) + BENCH_YAW)
             put(G_BIN, BIN_SPACING, _h01(fid, side, "bin") * BIN_SPACING, 0.7, 1.1, lambda out: _yaw(-out[0], -out[1]))
-    rows.extend(junction_props(roads, box, curb_h, left_hand))
+    rows.extend(junction_props(roads, box, curb_h, left_hand, ground))
     if speeds:
-        rows.extend(speed_signs(roads, speeds, box, left_hand, mph))
+        rows.extend(speed_signs(roads, speeds, box, left_hand, mph, ground))
     for fid, spec, line, _ in roads:
         if spec.urban or fid in lit or spec.cls not in POLE_CLASSES or len(line) < 2:
             continue
@@ -506,6 +532,9 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
         if not len(s):
             continue
         P, D = _at(line, s)
+        N = np.stack([-D[:, 1], D[:, 0]], axis=1) * side
+        Q = P[:, :2] + N * (spec.width / 2 + POLE_OFF_M)
+        P = np.c_[P[:, :2], on_ground(Q, P[:, 2])]         # (a pole beside the road stands on the fill's slope)
         run = []
         for p, d in zip(P, D):
             n = np.array([-d[1], d[0]]) * side

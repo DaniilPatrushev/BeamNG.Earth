@@ -60,7 +60,8 @@ class WordingTest(unittest.TestCase):
         self.assertEqual(set(credits.IMAGERY), set(imagery.SOURCES))
 
     def test_elevation_and_weather(self):
-        self.assertEqual(set(credits.ELEVATION), {demmod.MAPTERHORN["name"], demmod.AWS["name"]})
+        self.assertEqual(set(credits.ELEVATION), {demmod.MAPTERHORN["name"], demmod.AWS["name"], "local:fabdem"})
+        self.assertIn("CC BY-NC-SA", credits.ELEVATION["local:fabdem"])
         self.assertIn("mapterhorn.com/attribution", credits.ELEVATION["mapterhorn"])
         self.assertEqual(credits.full_label(credits.WEATHER_ID), weather.CREDIT)
         self.assertEqual(credits.label(credits.WEATHER_ID), "Open-Meteo")

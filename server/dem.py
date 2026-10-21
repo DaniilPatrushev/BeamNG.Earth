@@ -36,6 +36,7 @@ from PIL import Image
 import cache as cachemod
 import dsmground
 import fast
+import localdem
 import netfetch
 import staging
 
@@ -100,6 +101,7 @@ def _resize(a, size):
 
 
 class Dem:
+    local = None            # localdem.LocalDem (a region's own elevation), set in __init__
     disk = cachemod.NONE    # the server's cache.Cache (last use per file, the size cap); set by earthd
     ground_filter = True    # surface-model areas: buildings out, deeper zooms from that ground (see above)
 
@@ -115,6 +117,12 @@ class Dem:
         self.urgent_pool = ThreadPoolExecutor(URGENT_WORKERS, thread_name_prefix="dem-urgent")
         self._local = threading.local()
         self.mem_tiles = MEM_TILES if mem_tiles is None else mem_tiles
+        # a region's own bare-earth model ahead of Mapterhorn (localdem.py; BNE_LOCAL_DEM=off: not used)
+        self.local = localdem.LocalDem(os.path.join(cache_dir, "local")) \
+            if os.environ.get("BNE_LOCAL_DEM", "on") != "off" and os.path.isdir(os.path.join(cache_dir, "local")) \
+            else None
+        if self.local:
+            log.info("local elevation: %d cells of %s", len(self.local.cells), self.local.source)
         self._lru = OrderedDict()       # (z, x, y) -> float32 [TILE, TILE]
         self._inflight = {}             # (z, x, y) -> Future
         self._lock = threading.Lock()
@@ -315,6 +323,23 @@ class Dem:
         self._local.partial = True
 
     def _load_tile(self, key):
+        """A decoded tile: the local elevation where it has any (localdem: blended into the rest at its edge), else
+        _load_base."""
+        local = self.local
+        if local and local.covers_tile(*key):
+            h, w = local.tile(*key, TILE)
+            if (w > 0).any():
+                if (w >= 1.0).all():
+                    out = h
+                else:
+                    base = np.asarray(self._load_base(key), np.float32)
+                    out = np.where(w > 0, np.nan_to_num(h) * w + base * (1 - w), base).astype(np.float32)
+                self.served[key] = "local:" + (local.source or "local")
+                self._count("dem:local")
+                return out
+        return self._load_base(key)
+
+    def _load_base(self, key):
         """A decoded tile: from the mirror, else made (_make_tile) and, when it is all Mapterhorn's data as it will
         stay (no failover, no fetch failed on the way), written to the mirror."""
         got = self._mirror_get(key)

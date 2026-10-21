@@ -2848,6 +2848,29 @@ def _wall_runs(cut):
     return out
 
 
+def _on_other_road(roads, own, *pts):
+    """Which of the points (each array (k, 2), the same k) lie on the carriageway (+ 1 m) of a road of `roads` other
+    than roads[own]: True where any of them does. Pure."""
+    k = len(pts[0])
+    hit = np.zeros(k, bool)
+    q = np.concatenate([np.asarray(p, np.float64)[:, :2] for p in pts])
+    lo_q, hi_q = q.min(0), q.max(0)
+    for j, (_fid, spec, line, _) in enumerate(roads):
+        if j == own or len(line) < 2:
+            continue
+        line = np.asarray(line, np.float64)[:, :2]
+        half = max(spec.width, 0.0) / 2 + 1.0
+        if (line.max(0) < lo_q - half).any() or (line.min(0) > hi_q + half).any():
+            continue
+        a, b = line[:-1], line[1:]
+        ab = b - a
+        L2 = np.maximum((ab * ab).sum(1), 1e-12)
+        t = np.clip(((q[:, None, :] - a[None]) * ab[None]).sum(2) / L2[None], 0.0, 1.0)
+        d = np.hypot(*(q[:, None, :] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1)).min(1)
+        hit |= (d <= half).reshape(len(pts), k).any(0)
+    return hit
+
+
 def retaining_walls(frame, roads, elev, exact):
     """Stone retaining walls along the ground roads cut deeper than grading.WALL_CUT_M into the ground (the grading
     leaves the ground at its natural height right behind them): [dict(base (k, 2) the wall's face line, top (k,),
@@ -2855,12 +2878,16 @@ def retaining_walls(frame, roads, elev, exact):
     flat core (as grading plans it), from the road level up to the ground behind; none where another road comes in
     (its ground is graded to the road). Central Park's 86th Street Transverse between its stone walls (the user's
     photos, 2026-10-17). Pure given elev."""
+    import dsmmode
     import grading
     x0, y0, x1, y1 = exact
     pts_all, info = [], []
-    for fid, spec, pts, _ in roads:
+    for ri, (fid, spec, pts, _) in enumerate(roads):
         if spec.kind not in BUILT or len(pts) < 2:
             continue
+        la0, lo0, _ = frame.enu_to_geodetic(np.array([pts[0, 0]]), np.array([pts[0, 1]]), 0.0)
+        if dsmmode.is_dsm(float(np.asarray(la0)[0]), float(np.asarray(lo0)[0])):
+            continue        # a surface model's "cut" is the model's: the grading slopes back instead (grading.NO_WALL_M)
         xy, s = grading.resample(np.asarray(pts[:, :2], np.float64), WALL_STEP)
         if len(xy) < 2:
             continue
@@ -2877,17 +2904,21 @@ def retaining_walls(frame, roads, elev, exact):
         for side in (1.0, -1.0):
             probe = xy + nl * side * (core + grading.WALL_FLAT_M + grading.WALL_T_M + WALL_PROBE_M)
             pts_all.append(probe)
-            info.append((xy, z, nl * side, core, inside))
+            info.append((xy, z, nl * side, core, inside, ri))
     if not pts_all:
         return []
     P = np.concatenate(pts_all)
     la, lo, _ = frame.enu_to_geodetic(P[:, 0], P[:, 1], np.zeros(len(P)))
     g = np.asarray(frame.geodetic_to_enu(la, lo, np.asarray(elev(la, lo), np.float64))[2], np.float64)
     out, k = [], 0
-    for xy, z, out_n, core, inside in info:
+    for xy, z, out_n, core, inside, ri in info:
         gg = g[k:k + len(xy)]
         k += len(xy)
         cut = _wall_runs(gg - z) & inside
+        if cut.any():
+            # never on or across another road: the wall's face and the probe behind it kept off every other road's
+            # carriageway (a ramp beside, a side street's mouth bridged by the gap filling: walls stood in the lanes)
+            cut &= ~_on_other_road(roads, ri, xy + out_n * (core + 0.1), xy + out_n * (core + WALL_PROBE_M))
         i = 0
         while i < len(cut):
             if not cut[i]:
@@ -3256,9 +3287,12 @@ def build_tile(frame, tx, ty, cells, elev, urban_fn=None, walks=None, bridges=No
         import navgraph
         speeds = {fid: navgraph.road_mph(f, i, sp, mph) for fid, (f, i, sp) in seen.items()}
         decks = [(np.asarray(ch["n"], np.float64), ch["w"] / 2) for ch in chunks if ch.get("deck")]
+        def ground(q):              # the ground the props stand on (the physics ground, in the frame)
+            la, lo, _ = frame.enu_to_geodetic(q[:, 0], q[:, 1], np.zeros(len(q)))
+            return np.asarray(frame.geodetic_to_enu(la, lo, np.asarray(elev(la, lo), np.float64))[2], np.float64)
         props.extend(furniture.place(roads, walks, (x0, y0, x1, y1), wires=wires, town=bool(town), left_hand=left_hand,
                                      speeds={k: v for k, v in speeds.items() if v is not None}, mph=mph,
-                                     decks=decks))
+                                     decks=decks, ground=ground))
     if park is not None and walks is not None:      # curbside parking spots (parking.py)
         import parking
         dirs = {}

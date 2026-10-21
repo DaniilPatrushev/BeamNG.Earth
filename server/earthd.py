@@ -95,6 +95,7 @@ import roadmesh as roadmeshmod  # noqa: E402
 import roadwidth as roadwidthmod  # noqa: E402
 import mapdata as mapdatamod  # noqa: E402
 import dem as demmod  # noqa: E402
+import dsmmode  # noqa: E402
 import mapcells  # noqa: E402
 import pacer  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
@@ -3481,6 +3482,8 @@ async def main_async(args):
     global DETAIL_RING_M, AHEAD_ON
     DETAIL_RING_M = args.detail_ring
     AHEAD_ON = args.download_ahead == "on"
+    # the surface-model settings (dsmmode.py) ask the server's Dem, and the workers (spawned from here) their own
+    os.environ["BNE_DSM_REGISTER"] = "1"
     block_pools, far_pool = [], None
     if args.block_process == "on":
         ctx = multiprocessing.get_context("spawn")
@@ -3542,6 +3545,7 @@ async def main_async(args):
                     far_bld_pool=far_bld_pool,
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
+    dsmmode.register(server.dem)    # no lidar under a place: the generators' surface-model settings
     server.update_check = args.update_check == "on"
     server.lod_px = args.lod_px
 

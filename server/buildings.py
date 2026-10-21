@@ -1861,6 +1861,54 @@ def road_lines(frame, road_layers, x0, y0, margin=50.0, size=256.0):
     return out
 
 
+def carriage_lines(frame, road_layers, x0, y0, margin=50.0, size=256.0):
+    """[(polyline (k, 2) relative to (x0, y0), carriageway half width m)] of every drivable road on the ground near the
+    tile (service roads and links too; tracks not): the machine-learned footprints' test on surface-model ground."""
+    import roads as roadsmod
+    out = []
+    for f in road_layers:
+        if f is None or len(f.kind) == 0:
+            continue
+        cls = f.attrs.get("class")
+        if cls is None:
+            continue
+        bb = f.boxes(frame)
+        near = np.flatnonzero((bb[:, 2] - x0 >= -margin) & (bb[:, 0] - x0 <= size + margin)
+                              & (bb[:, 3] - y0 >= -margin) & (bb[:, 1] - y0 <= size + margin))
+        for i in near.tolist():
+            c = str(cls[i])
+            if c not in roadsmod.STYLE or c == "track" or roadsmod.level_ranges(f, i):
+                continue
+            a = f.coord_off[f.ring_off[f.part_off[i]]]
+            b = f.coord_off[f.ring_off[f.part_off[i + 1]]]
+            ll = f.lonlat[a:b]
+            if len(ll) < 2:
+                continue
+            e, n = mapgeom.enu_xy(f, frame, ll)
+            out.append((np.stack([e - x0, n - y0], 1), roadsmod.STYLE[c][0] / 2))
+    return out
+
+
+ML_CARRIAGE_M = 1.0         # m past a carriageway's half width a machine-learned footprint's centre counts as on it
+ML_INTO_M = 0.5             # ... or a corner of it this far inside the carriageway
+DSM_THROUGH_M = 3.0         # m of a public road's centre line through a building on surface-model ground: a misplaced
+                            # footprint (it stood as a block in the lanes; Moscow, 2026-10-21), left out
+
+
+def _on_carriageway(ring, carriage):
+    """Does the footprint ring (k, 2) stand on one of the carriageways [(line (k, 2), half width)]: its centre within
+    the half width (+ ML_CARRIAGE_M) of a centre line, a corner ML_INTO_M inside it, or a centre line through it?"""
+    c = ring.mean(0)
+    lo, hi = ring.min(0), ring.max(0)
+    for ln, half in carriage:
+        if (ln.max(0) < lo - half - ML_CARRIAGE_M).any() or (ln.min(0) > hi + half + ML_CARRIAGE_M).any():
+            continue
+        if _line_dist(c, [ln]) <= half + ML_CARRIAGE_M or road_through(ring, [ln]) >= 1.0 \
+                or min(_line_dist(v, [ln]) for v in ring) <= half - ML_INTO_M:
+            return True
+    return False
+
+
 PASSAGE_W = 11.0           # m: the passage a bridge's road takes through its tower (Tower Bridge: 2 lanes + walks) ...
 PASSAGE_H = 7.0            # ... this high over the tower's mapped bottom (its deck: the part starts at the road), ...
 PASSAGE_CLEAR = 6.5        # m: the way over a deck through a building (with the decks' heights)
@@ -2061,7 +2109,7 @@ CENTRE_PREFILTER_M = 1.0       # m of slack for Features.outer_centres (cumulati
 
 def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=(), west_town=False, roads_xy=None,
                    tunnels_xy=None, garages_xy=None, supports=None, bridges_xy=None, water_xy=None, decks=None,
-                   ml_roads_xy=None):
+                   ml_roads_xy=None, carriage=None):
     """[(Spec, gmin, gmax)] of the buildings whose footprint centroid is in the tile [x0, x1) x [y0, y1)
     (anchor frame), rings relative to (x0, y0). layers: mapgeom.Features of buildings (one per map cell; a
     building in two cells is taken once, by id); elev(lat, lon) the physics ground. part_layers: the
@@ -2070,7 +2118,12 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
     covering one's centre, is a parking structure). supports: support_rings (a building or part on one is the
     bridge's painted steel). bridges_xy / water_xy (bridge_lines, water_rings): a machine-learned footprint (not
     OSM) on a road bridge, over water or on a public road (roads_xy, or ml_roads_xy for that test alone: the far
-    buildings) is a deck, a boat or a vehicle, left out (_ml_false)."""
+    buildings) is a deck, a boat or a vehicle, left out (_ml_false). carriage (carriage_lines): on surface-model ground
+    (dsmmode) a machine-learned footprint on any carriageway is left out, and a building or part that a public road
+    (roads_xy) runs through for DSM_THROUGH_M to ROAD_THROUGH_M too."""
+    import dsmmode
+    la_c, lo_c, _ = frame.enu_to_geodetic(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.0)
+    dsm = dsmmode.is_dsm(float(la_c), float(lo_c))
     parts_of = {}                       # building id -> [(ring in the anchor frame, own height, bottom)]
     pseen = set()
     for f in part_layers:
@@ -2141,6 +2194,9 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                     r = clean_ring(pring - np.array([x0, y0]))
                     if r is None or _area2(r) / 2 < 4.0:
                         continue
+                    if dsm and pmh <= 0.5 and roads_xy and \
+                            DSM_THROUGH_M <= road_through(r, roads_xy) < ROAD_THROUGH_M:
+                        continue
                     rings.append(r)
                     attrs.append({"class": at["class"], "height": ph, "num_floors": None, "roof_shape": "flat",
                                   "building_height": top, "facade_material": at.get("facade_material"),
@@ -2158,13 +2214,17 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             if ring is None or _area2(ring) / 2 < MIN_AREA_M2:
                 continue
             if "src_dataset" in a and str(a["src_dataset"][i]) != "OpenStreetMap" and \
-                    _ml_false(ring, bridges_xy, water_xy, ml_roads_xy if ml_roads_xy is not None else roads_xy):
+                    (_ml_false(ring, bridges_xy, water_xy, ml_roads_xy if ml_roads_xy is not None else roads_xy)
+                     or (dsm and carriage and _on_carriageway(ring, carriage))):
                 continue
             if key is not None:
                 seen.add(key)
             rings.append(ring)
             mh = at.get("min_height")
             mh = float(mh) if mh is not None and np.isfinite(mh) and mh > 0 else 0.0
+            if dsm and mh <= 0.5 and roads_xy and DSM_THROUGH_M <= road_through(ring, roads_xy) < ROAD_THROUGH_M:
+                rings.pop()
+                continue
             if mh <= 0.5 and roads_xy and road_through(ring, roads_xy) >= ROAD_THROUGH_M:
                 mh = OVER_ROAD_CLEAR_M
                 h = at.get("height")
@@ -2539,7 +2599,8 @@ def road_tile_items(frame, tx, ty, md, ground, decks=None):
                           bridges_xy=bridge_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                           water_xy=water_rings(frame, [c.layers.get("water") for c in cds], x0, y0),
                           decks=[(np.asarray(xy, np.float64)[:, :2] - [x0, y0], np.asarray(z, np.float64))
-                                 for xy, z in decks] if decks else None)
+                                 for xy, z in decks] if decks else None,
+                          carriage=carriage_lines(frame, [c.layers.get("roads") for c in cds], x0, y0))
 
 
 TOWN_COVERAGE = 0.16        # a tile whose footprints cover less than this share is a town / suburb (heights)
@@ -2599,7 +2660,8 @@ def far_tile(frame, tx, ty, md, ground, out_dir, vfs_dir, aid):
                            supports=support_rings(frame, [c.layers.get("infrastructure") for c in cds], x0, y0),
                            bridges_xy=bridge_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                            water_xy=water_rings(frame, [c.layers.get("water") for c in cds], x0, y0),
-                           ml_roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0))
+                           ml_roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
+                           carriage=carriage_lines(frame, [c.layers.get("roads") for c in cds], x0, y0))
     mesh = build(items, lite=True)
     data = {"v": 1}
     if mesh is not None:

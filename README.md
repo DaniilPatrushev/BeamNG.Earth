@@ -140,7 +140,8 @@ docstring; for the .exe run `tools/build_bootloader.py` first: a bootloader buil
 false positives); GitHub Actions (`.github/workflows/release.yml`) builds both and publishes the release `v<VERSION>`
 whenever `main` gets a `VERSION` without one. Release zip of the source: `python3 tools/package.py`.
 
-Tests: `cd server && python3 -m unittest discover -s tests -p "test_*.py"` and
+Tests: `tools/test.sh` (the server's modules in parallel, the slow end-to-end ones left out; `--all` for every one,
+or name modules: `tools/test.sh grading dsm`), or `cd server && python3 -m unittest discover -s tests -p "test_*.py"`, and
 `cd mod/tests && for f in test_*.lua; do luajit $f; done`.
 
 ## Data sources and attribution

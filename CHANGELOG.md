@@ -2,6 +2,26 @@
 
 What changed in each release of BeamNG.Earth, newest first.
 
+## Unreleased (fork: moscow-dsm)
+
+### Roads and bridges where there is no lidar (Moscow and its oblast first)
+- **Smoother roads.** Where the elevation is the 30 m world model (Russia, Kazakhstan and most places without
+  national lidar), roads no longer follow its bumps: their profile is smoothed much more, held to a sensible grade,
+  and roads meet at one height at junctions. Around Moscow the up-and-down roughness of most road classes fell by a
+  third to a half in the audit (`tools/road_audit.py`), and the steps where two roads meet went from up to 13 cm to under 4 cm.
+- **Overpasses clear the road under them.** The world model has no road embankments, so short bridges lay on the
+  road they cross. Now the roads leading onto a bridge are raised to it there, for every road class (also
+  motorways, trunks and their ramps, and both carriageways of a divided road). At the Leningradskoye shosse / MKAD
+  interchange the lowest deck over a road went from 1.7 m to 8 m.
+- **No stone walls in the lanes.** Retaining walls are no longer built from the world model's bumps, and never on
+  another road anywhere.
+- **Fewer boxes on the road.** Machine-learned building outlines (often a lorry or a kiosk) that stand on a
+  carriageway are left out, and so are buildings a street runs through.
+- **Traffic lights, signs and poles stand on the ground** where they are, not at the height of the junction's
+  centre (they floated beside embankments and ramps). Signal heads are no longer put on bridge decks.
+- **Optional: FABDEM for your region.** Download FABDEM (bare-earth Copernicus, non-commercial licence) and import it
+  with `tools/fabdem_import.py`; the server then uses it there ahead of the default elevation.
+
 ## 1.5.4 beta (2026-10-21)
 
 Works with BeamNG.drive 0.40.
